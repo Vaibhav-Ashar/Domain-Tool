@@ -2,32 +2,75 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 import pandas as pd
 from datetime import timedelta
+import os
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Data file name (used by load_data and Gmail fetcher)
+DATA_CSV_PATH = os.environ.get("DATA_CSV_PATH", "domain_data.csv")
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for React frontend
 
 # Load data with optimized dtypes for faster load and lower memory
-# Uses "compressed_data (1).csv": Day, Advertiser, Campaign, Domain, Ad Impressions, Clicks, Weighted Conversion
+# Expects: Day (format 2026-02-14), Advertiser, Campaign, Domain, Ad Impressions, Clicks, Weighted Conversion
 def load_data():
-    """Load and preprocess the data"""
+    """Load and preprocess the data from DATA_CSV_PATH. Returns empty DataFrame if file missing (e.g. localhost before first Gmail fetch)."""
+    if not os.path.isfile(DATA_CSV_PATH):
+        logger.warning("Data file not found: %s. Use Gmail fetcher or add file, then reload.", DATA_CSV_PATH)
+        return pd.DataFrame(columns=[
+            "Day", "Advertiser", "Campaign", "Domain", "Ad Impressions", "Clicks", "Weighted Conversion",
+            "Date", "Impressions", "Conversions", "Clean Domain", "Clean Keyword"
+        ]).astype({"Date": "datetime64[ns]", "Clicks": "int64", "Impressions": "int64"})
     df = pd.read_csv(
-        "compressed_data (1).csv",
+        DATA_CSV_PATH,
         dtype={'Clicks': 'int64', 'Ad Impressions': 'int64'},
     )
-    df['Date'] = pd.to_datetime(df['Day'])
+    # Normalize column names: some CSVs use "Domain (Old)" instead of "Domain"
+    if 'Domain' not in df.columns and 'Domain (Old)' in df.columns:
+        df['Domain'] = df['Domain (Old)'].astype(str)
+    elif 'Domain' not in df.columns:
+        raise ValueError("CSV must have a 'Domain' or 'Domain (Old)' column")
+    # Day column: format 2026-02-14 (strip whitespace/tabs)
+    day_col = df['Day'].astype(str).str.strip()
+    df['Date'] = pd.to_datetime(day_col, format='%Y-%m-%d', errors='coerce')
+    df = df.dropna(subset=['Date'])
     df['Impressions'] = df['Ad Impressions'].astype('int64')
     df['Conversions'] = df['Weighted Conversion'].fillna(0).astype('float64')  # sum as float, display as int
     df['Clean Domain'] = df['Domain'].str.replace(r'^www\.', '', regex=True, case=False)
     df['Clean Keyword'] = ''  # no keyword column in this file; analysis is domain-only
     return df
 
+# Global dataframe; reload_data() updates this after Gmail fetch
 df = load_data()
+
+
+def reload_data():
+    """Reload the in-memory dataframe from disk (call after Gmail fetcher updates the CSV)."""
+    global df
+    try:
+        df = load_data()
+        logger.info("Data reloaded from %s", DATA_CSV_PATH)
+    except Exception as e:
+        logger.exception("Failed to reload data: %s", e)
 
 @app.route('/')
 @app.route('/api/health')
 def health():
     """Health check for load balancers"""
     return jsonify({'status': 'ok', 'service': 'domain-performance-api'})
+
+
+@app.route('/api/reload', methods=['POST', 'GET'])
+def api_reload():
+    """Reload data from disk (e.g. after Gmail fetcher updates domain_data.csv). No restart needed."""
+    try:
+        reload_data()
+        return jsonify({'status': 'ok', 'message': 'Data reloaded from ' + DATA_CSV_PATH})
+    except Exception as e:
+        logger.exception("Reload failed: %s", e)
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 def get_week_range(date, week_offset=0):
     """Get start and end date for a week - 7 days ending on selected date"""
@@ -74,15 +117,16 @@ def calculate_metrics(advertiser, campaign, week_start, week_end, metric_type='C
 @app.route('/api/filters', methods=['GET'])
 def get_filters():
     """Get available filter options"""
-    advertisers = sorted(df['Advertiser'].unique().tolist())
-    
+    advertisers = sorted(df['Advertiser'].unique().tolist()) if len(df) else []
+    if len(df) and pd.notna(df['Date'].min()) and pd.notna(df['Date'].max()):
+        date_min = df['Date'].min().strftime('%Y-%m-%d')
+        date_max = df['Date'].max().strftime('%Y-%m-%d')
+    else:
+        date_min = date_max = pd.Timestamp.now().strftime('%Y-%m-%d')
     return jsonify({
         'advertisers': advertisers,
         'metrics': ['Conversions', 'Clicks', 'Impressions'],
-        'dateRange': {
-            'min': df['Date'].min().strftime('%Y-%m-%d'),
-            'max': df['Date'].max().strftime('%Y-%m-%d')
-        }
+        'dateRange': {'min': date_min, 'max': date_max}
     })
 
 @app.route('/api/campaigns', methods=['GET'])
@@ -136,7 +180,8 @@ def get_dashboard_data():
     top_n = data.get('topN', 5)
     advertiser = data.get('advertiser', 'All Advertisers')
     campaign = data.get('campaign', 'All Campaigns')
-    selected_date = pd.to_datetime(data.get('date', df['Date'].max()))
+    default_date = df['Date'].max() if len(df) and pd.notna(df['Date'].max()) else pd.Timestamp.now()
+    selected_date = pd.to_datetime(data.get('date', default_date))
     metric_type = data.get('metric', 'Conversions')
     analysis_type = data.get('analysisType', 'Domain')
     
@@ -350,6 +395,45 @@ def get_dashboard_data():
             }
         }
     })
+
+
+# ---- Daily Gmail fetch at fixed UTC hour ----
+def _job_fetch_gmail_and_reload():
+    """Scheduled job: fetch latest CSV from Gmail, save to DATA_CSV_PATH, then reload in-memory data."""
+    try:
+        from gmail_fetcher import fetch_and_save
+        search_query = os.environ.get("GMAIL_SEARCH_QUERY")
+        subject_filter = os.environ.get("GMAIL_SUBJECT_FILTER", "").strip() or None
+        ok, result = fetch_and_save(
+            output_path=DATA_CSV_PATH,
+            search_query=search_query,
+            subject_filter=subject_filter,
+        )
+        if ok:
+            reload_data()
+            logger.info("Gmail fetch succeeded: %s", result)
+        else:
+            logger.warning("Gmail fetch failed: %s", result)
+    except Exception as e:
+        logger.exception("Gmail fetch job error: %s", e)
+
+
+def _start_gmail_scheduler():
+    """Start APScheduler to run Gmail fetch at a fixed UTC hour if env is set."""
+    if not os.environ.get("GMAIL_REFRESH_TOKEN"):
+        return
+    try:
+        hour = int(os.environ.get("GMAIL_FETCH_UTC_HOUR", "9"))
+    except ValueError:
+        hour = 9
+    from apscheduler.schedulers.background import BackgroundScheduler
+    scheduler = BackgroundScheduler(timezone="UTC")
+    scheduler.add_job(_job_fetch_gmail_and_reload, "cron", hour=hour, minute=0)
+    scheduler.start()
+    logger.info("Gmail fetch scheduler started: daily at %02d:00 UTC", hour)
+
+
+_start_gmail_scheduler()
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)

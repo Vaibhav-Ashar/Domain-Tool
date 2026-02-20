@@ -1,2 +1,6 @@
 # Data file (do not commit)
 compressed_data (1).csv
+domain_data.csv
+
+# Secrets (do not commit)
+.env

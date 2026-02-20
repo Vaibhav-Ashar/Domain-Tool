@@ -199,13 +199,15 @@ export default function DashboardApp() {
     const dataMin = filterOptions.dateRange?.min;
     const dataMax = filterOptions.dateRange?.max;
     if (!dataMin || !dataMax || !date) return null;
-    const earliest = new Date(dataMin);
-    earliest.setDate(earliest.getDate() + 13);
+    const earliestSelectable = new Date(dataMin);
+    earliestSelectable.setDate(earliestSelectable.getDate() + 13);
     const selected = new Date(date);
-    const latest = new Date(dataMax);
-    if (selected < earliest || selected > latest) {
+    const latestSelectable = new Date(dataMax);
+    if (selected < earliestSelectable || selected > latestSelectable) {
       const fmt = (d) => d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-      return `Use a date between ${fmt(earliest)} and ${fmt(latest)} for 2-week comparison.`;
+      const first = earliestSelectable <= latestSelectable ? earliestSelectable : latestSelectable;
+      const second = earliestSelectable <= latestSelectable ? latestSelectable : earliestSelectable;
+      return `Use a date between ${fmt(first)} and ${fmt(second)} for 2-week comparison.`;
     }
     return null;
   };
