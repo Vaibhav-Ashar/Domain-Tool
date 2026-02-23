@@ -4,11 +4,13 @@ import pandas as pd
 from datetime import timedelta
 import os
 import logging
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Data file name (used by load_data and Gmail fetcher)
-DATA_CSV_PATH = os.environ.get("DATA_CSV_PATH", "domain_data.csv")
+# Data file: use env if set, else resolve relative to this script so it's always in project folder
+_default_csv = Path(__file__).resolve().parent / "domain_data.csv"
+DATA_CSV_PATH = os.environ.get("DATA_CSV_PATH") or str(_default_csv)
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for React frontend
@@ -27,14 +29,19 @@ def load_data():
         DATA_CSV_PATH,
         dtype={'Clicks': 'int64', 'Ad Impressions': 'int64'},
     )
+    df.columns = df.columns.str.strip()
     # Normalize column names: some CSVs use "Domain (Old)" instead of "Domain"
     if 'Domain' not in df.columns and 'Domain (Old)' in df.columns:
         df['Domain'] = df['Domain (Old)'].astype(str)
     elif 'Domain' not in df.columns:
         raise ValueError("CSV must have a 'Domain' or 'Domain (Old)' column")
-    # Day column: format 2026-02-14 (strip whitespace/tabs)
-    day_col = df['Day'].astype(str).str.strip()
+    # Day column: accept 2026-02-14, 2026/02/14, or ISO with time (strip whitespace)
+    date_col_name = 'Day' if 'Day' in df.columns else 'Date'
+    day_col = df[date_col_name].astype(str).str.strip()
     df['Date'] = pd.to_datetime(day_col, format='%Y-%m-%d', errors='coerce')
+    # If strict format parsed nothing, try inferring (e.g. 2026/02/14 or ISO datetime)
+    if df['Date'].isna().all():
+        df['Date'] = pd.to_datetime(day_col, errors='coerce')
     df = df.dropna(subset=['Date'])
     df['Impressions'] = df['Ad Impressions'].astype('int64')
     df['Conversions'] = df['Weighted Conversion'].fillna(0).astype('float64')  # sum as float, display as int
@@ -62,14 +69,53 @@ def health():
     return jsonify({'status': 'ok', 'service': 'domain-performance-api'})
 
 
+@app.route('/api/data-status', methods=['GET'])
+def api_data_status():
+    """Return whether data file exists and how many rows are loaded (for debugging)."""
+    exists = os.path.isfile(DATA_CSV_PATH)
+    rows = len(df)
+    date_min = None
+    date_max = None
+    if rows and pd.notna(df['Date'].min()) and pd.notna(df['Date'].max()):
+        date_min = df['Date'].min().strftime('%Y-%m-%d')
+        date_max = df['Date'].max().strftime('%Y-%m-%d')
+    return jsonify({
+        'file_path': DATA_CSV_PATH,
+        'file_exists': exists,
+        'rows_loaded': rows,
+        'date_min': date_min,
+        'date_max': date_max,
+        'hint': 'Call POST /api/reload to load the file into memory if rows_loaded is 0 but file_exists is true.',
+    })
+
+
 @app.route('/api/reload', methods=['POST', 'GET'])
 def api_reload():
-    """Reload data from disk (e.g. after Gmail fetcher updates domain_data.csv). No restart needed."""
+    """Reload data from disk (e.g. after analytics fetch updates domain_data.csv). No restart needed."""
     try:
         reload_data()
-        return jsonify({'status': 'ok', 'message': 'Data reloaded from ' + DATA_CSV_PATH})
+        return jsonify({'status': 'ok', 'message': 'Data reloaded from ' + DATA_CSV_PATH, 'rows': len(df)})
     except Exception as e:
         logger.exception("Reload failed: %s", e)
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/fetch', methods=['POST', 'GET'])
+def api_fetch():
+    """Fetch data: if ANALYTICS_API_KEY set, run queue flow (submit→poll→download) for last N days (default 45); else use ANALYTICS_DATA_URL. Then reload."""
+    try:
+        if os.environ.get("ANALYTICS_API_KEY") or os.environ.get("ANALYTICS_BEARER_TOKEN"):
+            from analytics_queue_fetcher import fetch_and_save
+            ok, result = fetch_and_save(output_path=DATA_CSV_PATH, last_n_days=None)
+        else:
+            from analytics_fetcher import fetch_and_save
+            ok, result = fetch_and_save(output_path=DATA_CSV_PATH)
+        if not ok:
+            return jsonify({'status': 'error', 'message': result}), 400
+        reload_data()
+        return jsonify({'status': 'ok', 'message': 'Fetched and reloaded: ' + result})
+    except Exception as e:
+        logger.exception("Fetch failed: %s", e)
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 def get_week_range(date, week_offset=0):
@@ -181,7 +227,19 @@ def get_dashboard_data():
     advertiser = data.get('advertiser', 'All Advertisers')
     campaign = data.get('campaign', 'All Campaigns')
     default_date = df['Date'].max() if len(df) and pd.notna(df['Date'].max()) else pd.Timestamp.now()
-    selected_date = pd.to_datetime(data.get('date', default_date))
+    raw_date = data.get('date') or None
+    if raw_date is None or (isinstance(raw_date, str) and not raw_date.strip()):
+        selected_date = default_date
+    else:
+        selected_date = pd.to_datetime(raw_date, errors='coerce')
+        if pd.isna(selected_date):
+            selected_date = default_date
+    # Use date-only (midnight) so week ranges match CSV dates regardless of timezone
+    selected_date = pd.Timestamp(selected_date)
+    if getattr(selected_date, 'tz', None) is not None:
+        selected_date = pd.Timestamp(selected_date.date())
+    else:
+        selected_date = selected_date.normalize()
     metric_type = data.get('metric', 'Conversions')
     analysis_type = data.get('analysisType', 'Domain')
     
@@ -397,43 +455,37 @@ def get_dashboard_data():
     })
 
 
-# ---- Daily Gmail fetch at fixed UTC hour ----
-def _job_fetch_gmail_and_reload():
-    """Scheduled job: fetch latest CSV from Gmail, save to DATA_CSV_PATH, then reload in-memory data."""
+# ---- Daily analytics queue fetch at 5 AM UTC ----
+def _job_fetch_analytics_queue_and_reload():
+    """Scheduled job: submit queue for last N days (default 45), poll until succeeded, download CSV, reload. Runs at 5 AM UTC."""
     try:
-        from gmail_fetcher import fetch_and_save
-        search_query = os.environ.get("GMAIL_SEARCH_QUERY")
-        subject_filter = os.environ.get("GMAIL_SUBJECT_FILTER", "").strip() or None
-        ok, result = fetch_and_save(
-            output_path=DATA_CSV_PATH,
-            search_query=search_query,
-            subject_filter=subject_filter,
-        )
+        from analytics_queue_fetcher import fetch_and_save
+        ok, result = fetch_and_save(output_path=DATA_CSV_PATH, last_n_days=None)
         if ok:
             reload_data()
-            logger.info("Gmail fetch succeeded: %s", result)
+            logger.info("Analytics queue fetch succeeded: %s", result)
         else:
-            logger.warning("Gmail fetch failed: %s", result)
+            logger.warning("Analytics queue fetch failed: %s", result)
     except Exception as e:
-        logger.exception("Gmail fetch job error: %s", e)
+        logger.exception("Analytics queue fetch job error: %s", e)
 
 
-def _start_gmail_scheduler():
-    """Start APScheduler to run Gmail fetch at a fixed UTC hour if env is set."""
-    if not os.environ.get("GMAIL_REFRESH_TOKEN"):
+def _start_analytics_scheduler():
+    """Start APScheduler to run analytics queue flow daily at 5 AM UTC if ANALYTICS_API_KEY is set."""
+    if not os.environ.get("ANALYTICS_API_KEY") and not os.environ.get("ANALYTICS_BEARER_TOKEN"):
         return
     try:
-        hour = int(os.environ.get("GMAIL_FETCH_UTC_HOUR", "9"))
+        hour = int(os.environ.get("ANALYTICS_QUEUE_UTC_HOUR", "5"))
     except ValueError:
-        hour = 9
+        hour = 5
     from apscheduler.schedulers.background import BackgroundScheduler
     scheduler = BackgroundScheduler(timezone="UTC")
-    scheduler.add_job(_job_fetch_gmail_and_reload, "cron", hour=hour, minute=0)
+    scheduler.add_job(_job_fetch_analytics_queue_and_reload, "cron", hour=hour, minute=0)
     scheduler.start()
-    logger.info("Gmail fetch scheduler started: daily at %02d:00 UTC", hour)
+    logger.info("Analytics queue scheduler started: daily at %02d:00 UTC (last N days, default 45)", hour)
 
 
-_start_gmail_scheduler()
+_start_analytics_scheduler()
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)

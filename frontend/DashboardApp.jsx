@@ -141,6 +141,7 @@ export default function DashboardApp() {
   const [showFilterDownloadMenu, setShowFilterDownloadMenu] = useState(false);
   const [previewDate, setPreviewDate] = useState(null); // Date selected in calendar but not yet applied
   const [calendarOpen, setCalendarOpen] = useState(false);
+  const [reloadStatus, setReloadStatus] = useState(null);
   const filterDownloadMenuRef = useRef(null);
 
   // Close Download menu on outside click
@@ -291,6 +292,24 @@ export default function DashboardApp() {
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleReloadData = async () => {
+    setReloadStatus('Reloading...');
+    try {
+      const r = await fetch(`${API_BASE_URL}/reload`, { method: 'POST' });
+      const data = await r.json();
+      if (data.status === 'ok') {
+        setReloadStatus(`Loaded ${data.rows ?? '?'} rows`);
+        await fetchFilterOptions();
+        if (filters.date) await fetchDashboardData();
+      } else {
+        setReloadStatus(data.message || 'Reload failed');
+      }
+    } catch (e) {
+      setReloadStatus('Error: ' + (e.message || 'network error'));
+    }
+    setTimeout(() => setReloadStatus(null), 4000);
   };
 
   const handleFilterChange = async (key, value) => {
@@ -766,9 +785,18 @@ export default function DashboardApp() {
           {/* Generate and Download buttons */}
           <div className="mt-4 pt-4 border-t border-slate-100 flex items-center justify-between">
             <div className="text-[11px] text-slate-400">
-              {!dashboardData && <span>Select filters and click Generate to load dashboard</span>}
+              {reloadStatus && <span className="text-blue-600 font-medium">{reloadStatus}</span>}
+              {!reloadStatus && !dashboardData && <span>Select filters and click Generate to load dashboard</span>}
+              {!reloadStatus && dashboardData && <span>Data loaded. Change filters and click Generate to refresh.</span>}
             </div>
             <div className="flex items-center gap-2">
+              <button
+                onClick={handleReloadData}
+                title="Reload domain_data.csv from disk (use after fetching new data)"
+                className="w-auto py-2.5 px-3 bg-slate-100 border border-slate-300 text-slate-700 rounded-lg hover:bg-slate-200 transition-all font-semibold text-xs"
+              >
+                Reload data
+              </button>
               <button
                 onClick={handleGenerateDashboard}
                 disabled={!filters.date || !!getTwoWeekMessage(previewDate || filters.date)}
